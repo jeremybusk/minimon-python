@@ -12,11 +12,54 @@ import socket
 import dns.resolver
 from urllib.parse import urlparse
 from requests import get
+import psycopg2
+import psycopg2.extras
+from bs4 import BeautifulSoup
+import re
+from html import escape
+# urlibpars
+# urllib.parse
 
 # print(env['project.name'])
 conf = EnvYAML('conf.yml')
 kafka_topic = conf['kafka.topic']
 kafka_socket = conf['kafka.socket']
+
+
+
+pgconn = psycopg2.connect(host=conf['postgres.host'],
+                          dbname=conf['postgres.dbname'],
+                          user=conf['postgres.dbuser'],
+                          password=conf['postgres.dbpass'])
+
+
+def test_text_contains_regexc(regexc, text):
+    code = 1
+    match = regexc.search(text)
+    # r'<title[^>]*>([^<]+)</title>'
+    # match = re.search(pattern, string)
+    if match:
+        code = 0
+        # process(match)
+    else:
+        code = 1
+    return code
+    
+    response = urllib2.urlopen(url)
+    soup = BeautifulSoup(response.read(), from_encoding=response.info().getparam('charset'))
+    title = soup.find('title').text
+
+
+def init_db():
+    with connection as cursor:
+        cursor.execute(open("schema.sql", "r").read())
+
+
+def get_service_urls():
+    cur = pgconn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    sql = "SELECT name, url FROM apis"
+    cur.execute(sql)
+    return jsonify(cur.fetchall())
 
 
 def test_tcp_port_open(host, port):
@@ -51,99 +94,105 @@ intranet_ip = get_intranet_ip()
 internet_ip = get_internet_ip()
 monitor_id = f"{intranet_ip}-{internet_ip}"
 
-def consume(topic):
-    consumer = KafkaConsumer(topic)
-    consumer = KafkaConsumer(topic, auto_offset_reset='latest')  # earliest
-    for msg in consumer:
-        print(msg)
+
+# def get_event(topic):
+#     consumer = KafkaConsumer(topic)
+#     consumer = KafkaConsumer(topic, auto_offset_reset='latest')  # earliest
+#    for msg in consumer:
+#         print(msg)
 
 
-def produce(socket, topic):
+def fput_event(socket, topic, msg):
     producer = KafkaProducer(bootstrap_servers=socket)
-    for count in range(10):
-        msgb = f"{count} msg bytes".encode()
-        producer.send(topic, msgb)
+    # for count in range(10):
+    msgb = f"msg bytes".encode()
+    msgb = msg.encode()
+    producer.send(topic, msgb)
+    producer.flush()
 
 
-def check_url(url):
-    r = requests.get(url)
-    vars(r)
+def test_text_contains_string(text, string):
+    if string in text:
+        code = 0
+    return code
 
 
-async def check_dns(fqdn):
-    start = time.time()
-    dns_response = dns.resolver.query(fqdn, 'A')
-    for host in dns_response: 
-        # print(host)
-        socket_open = test_tcp_port_open(host, 443)
-        # print(f"{host} {socket_open}")
-        # status = await resp.status()
-        end = time.time()
-        time_delta = end - start
-        retval = f"{fqdn} {host} {socket_open} {time_delta}"
-        print(retval)
-
-    # return retval
-    return None 
+class URL():
+    def __init__(self, uuid, url, regex):
+        self.uuid = uuid
+        self.url = url
+        self.regex = regex
+        self.fqdn = urlparse(url).hostname
 
 
-async def check_url(client, url, contains_string):
-    # async with client.get('http://python.org') as resp:
-    start = time.time()
-    async with client.get(url) as resp:
+    async def get(self, client):
+        start = time.time()
+        async with client.get(self.url) as rsp:
+            self.rsp_text = await rsp.text()
+            end = time.time()
+            self.load_time = end - start
+            self.rsp_code = rsp.status
+            self.test_rsp_text_regex_code = self.test_rsp_text_regex()
 
-        text = await resp.text()
-        # rjson = await resp.json()
-        end = time.time()
-        load_time = end - start
-        # status_time = status_end - start
-        if contains_string in text:
-            text_contains_string = True
+
+    def test_rsp_text_regex(self):
+        regexc = re.compile(self.regex)
+        code = 1
+        match = regexc.search(self.rsp_text)
+        match = regexc.search(self.rsp_text)
+        if match:
+            code = 0
         else:
-            text_contains_string = False
+            code = 1
+        return code
 
-        # print(url, ": ", load_time, "response length:", len(text))
-        text_length = len(text)
-        status_code = resp.status
-        # retval = f"url: {url}, load_time: {load_time}, status_time: {status_time}, text_contains_string: {text_contains_string}, text_length: {text_length}"
-        retval = f"mid: {monitor_id},  url: {url}, load_time: {load_time}, status_code: {status_code}, text_contains_string: {text_contains_string}, text_length: {text_length}"
-        # assert resp.status == 200
-        # assert "Example" in resp.text() 
-        return retval 
+
+    async def get_dns(self):
+        start = time.time()
+        dns_response = dns.resolver.query(self.fqdn, 'A')
+        for host in dns_response: 
+            socket_open = test_tcp_port_open(host, 443)
+            end = time.time()
+            time_delta = end - start
+            msg = f"{fqdn} {host} {socket_open} {time_delta}"
+            fput_event(kafka_socket, kafka_topic, msg)
+
+
+    def put_event(self, kafka_socket, topic, msg):
+        producer = KafkaProducer(bootstrap_servers=kafka_socket)
+        msgb = msg.encode()
+        producer.send(topic, msgb)
+        producer.flush()
 
 
 async def check_urls():
-    for app in conf['apps']:
-        i = f"apps.{app}.url"
-        url = conf[i]
-        i = f"apps.{app}.contains_string"
-        fqdn = urlparse(url).hostname
-        r = await check_dns(fqdn)
-        print(r)
-        contains_string = conf[i]
-        # print(url)
-        async with aiohttp.ClientSession() as client:
-            # url = 'https://example.com'
-            # url = 'https://.asdfdasff.example.com'
-            r = await check_url(client, url, contains_string)
-            print(r)
-            # assert "Example" in html
-            # print(html)
-
+    cur = pgconn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    sql = "SELECT * FROM url"
+    cur.execute(sql)
+    rows = cur.fetchall()
+    i = 1
+    urls = []
+    async with aiohttp.ClientSession() as client:
+        for row in rows:
+            fqdn = urlparse(row['url']).hostname
+            url = URL(row['uuid'], row['url'], row['rsp_text_regex'])
+            urls.append(url)
+            await url.get(client)
+            url.rsp_text = None
+            url.event = json.dumps(url.__dict__)
+            print(url.event)
+            url.put_event(kafka_socket, kafka_topic, url.event)
 
 
 def main():
     while True:
+        fput_event("localhost:9092", "quickstart-events", "foo")
         loop = asyncio.get_event_loop()
         loop.run_until_complete(check_urls())
         # loop.run_until_complete(check_dns())
         time.sleep(conf['check_interval'])
-    # asyncio.run(fmain())
-    # produce()
-    # consume(kafka_topic)
-    # url = "https://uvoo.io"
-    # check_url(url)
 
 
 if __name__ == "__main__":
     main() 
+    # mmain() 
