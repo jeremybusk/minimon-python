@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-from kafka import KafkaConsumer, KafkaProducer, TopicPartition
+from kafka import KafkaConsumer, KafkaProducer
 from kafka.admin import KafkaAdminClient, NewTopic
 import asyncio
 import aiohttp
@@ -14,7 +14,6 @@ import psycopg2
 import psycopg2.extras
 import re
 import argparse
-from html import escape
 
 
 conf = EnvYAML('conf.yml')
@@ -25,26 +24,30 @@ pgconn = psycopg2.connect(host=conf['postgres.host'],
                           user=conf['postgres.dbuser'],
                           password=conf['postgres.dbpass'])
 producer = KafkaProducer(bootstrap_servers=bootstrap_servers,
-                         value_serializer=lambda x: 
+                         value_serializer=lambda x:
                          json.dumps(x).encode('utf-8'))
-consumer = KafkaConsumer(topic, bootstrap_servers=bootstrap_servers, auto_offset_reset='latest')
+consumer = KafkaConsumer(topic, bootstrap_servers=bootstrap_servers,
+                         auto_offset_reset='latest')
 
 
 def init_kafka_topic(topic='test', client_id='test'):
     admin_client = KafkaAdminClient(
-        bootstrap_servers=bootstrap_servers, 
+        bootstrap_servers=bootstrap_servers,
         client_id=client_id
     )
     topic_list = []
-    topic_list.append(NewTopic(name=topic, num_partitions=1, replication_factor=1))
+    topic_list.append(NewTopic(name=topic, num_partitions=1,
+                      replication_factor=1))
     admin_client.create_topics(new_topics=topic_list, validate_only=False)
 
 
 def init_postgres():
-    cur.execute("DROP DATABASE IF EXISTS" %s, (conf['postgres.dbname'],))
-    cur.execute("CREATE DATABASE" %s, (conf['postgres.dbname'],))
-    # cur.execute("WHERE NOT EXISTS (SELECT FROM pg_database WHERE = 'mydb')")
-    cur.execute(open("schema.sql", "r").read())
+    with pgconn.cursor() as cur:
+        cur.execute("DROP DATABASE IF EXISTS %s", (conf['postgres.dbname'],))
+        cur.execute("CREATE DATABASE %s", (conf['postgres.dbname'],))
+        # cur.execute("WHERE NOT EXISTS
+        #              (SELECT FROM pg_database WHERE = 'mydb')")
+        cur.execute(open("schema.sql", "r").read())
 
 
 def test_init():
@@ -69,7 +72,8 @@ def add_url(url_group_id, url):
         cur.execute("select * from url where url = %s", (url,))
         if cur.rowcount == 0:
             print(f"Adding {url}")
-            cur.execute("INSERT INTO url (url_group_id, url) VALUES (%s, %s)", (url_group_id, url,))
+            cur.execute("INSERT INTO url (url_group_id, url) VALUES (%s, %s)",
+                        (url_group_id, url,))
             pgconn.commit()
 
 
@@ -77,14 +81,14 @@ def test_tcp_port(host, port):
     start = time.time()
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(1)
-    address = (host, port)
     try:
         s.connect((str(host), int(port)))
         s.shutdown(socket.SHUT_RDWR)
         s.close()
         tcp_rsp_time = time.time() - start
     except Exception as e:
-        tcp_rsp_time = None 
+        tcp_rsp_time = None
+        str(e)
     return tcp_rsp_time
 
 
@@ -104,7 +108,8 @@ def get_intranet_ip():
 def get_monitor_ips():
     intranet_ip = get_intranet_ip()
     internet_ip = get_internet_ip()
-    monitor_id = f"{intranet_ip}-{internet_ip}"
+    monitor_location = f"{intranet_ip}-{internet_ip}"
+    str(monitor_location)
 
 
 def get_events(topic, offset='earliest'):
@@ -117,10 +122,10 @@ def get_events(topic, offset='earliest'):
 
 
 def get_event_count(topic, offset='earliest'):
-    consumer = KafkaConsumer(topic, auto_offset_reset=offset)  # earliest/latest
+    consumer = KafkaConsumer(topic, auto_offset_reset=offset)
     msg_count = 0
     for msg in consumer:
-        count += 1
+        msg_count += 1
     print(msg_count)
 
 
@@ -146,11 +151,11 @@ def get_rsp_text_regex_count(regex, text):
         return
     regexc = re.compile(regex)
     count = len(regexc.findall(text))
-    return count 
+    return count
 
 
-async def get_url(session, url_id, url, rsp_text_regex ):
-    r = {} 
+async def get_url(session, url_id, url, rsp_text_regex):
+    r = {}
     r['url_id'] = url_id
     try:
         async with session.get(url, allow_redirects=True) as rsp:
@@ -159,21 +164,21 @@ async def get_url(session, url_id, url, rsp_text_regex ):
             rsp_text = await rsp.text()
             rsp_time = time.time() - start
             regex_count = get_rsp_text_regex_count(rsp_text_regex, rsp_text)
-            r['error'] = None 
-            r['rsp_regex_count'] = regex_count 
-            r['rsp_status_code'] =rsp.status 
+            r['error'] = None
+            r['rsp_regex_count'] = regex_count
+            r['rsp_status_code'] = rsp.status
             r['rsp_time'] = rsp_time
-            r['rsp_url'] =str(rsp.url)
+            r['rsp_url'] = str(rsp.url)
             r['dns'] = dns
-            return r 
+            return r
     except Exception as e:
         r['error'] = str(e)
-        r['rsp_regex_count'] = None 
+        r['rsp_regex_count'] = None
         r['rsp_status_code'] = None
         r['rsp_time'] = None
         r['rsp_url'] = None
-        r['dns'] = None 
-        return r 
+        r['dns'] = None
+        return r
 
 
 def get_dns(url):
@@ -191,7 +196,7 @@ def get_dns(url):
             hosts['host'] = str(host)
             hosts['tcp_rsp_time'] = tcp_rsp_time
             r['tcp_times'].append(hosts)
-        return r 
+        return r
     except Exception as e:
         return str(e)
 
@@ -206,7 +211,10 @@ async def check_urls():
     async with aiohttp.ClientSession(timeout=timeout) as session:
         tasks = []
         for row in rows:
-            tasks.append(asyncio.ensure_future(get_url(session, row['url_id'], row['url'], row['rsp_text_regex'])))
+            tasks.append(asyncio.ensure_future(get_url(session,
+                                                       row['url_id'],
+                                                       row['url'],
+                                                       row['rsp_text_regex'])))
         rsps = await asyncio.gather(*tasks)
         for rsp in rsps:
             try:
@@ -219,7 +227,8 @@ def main():
     parser = argparse.ArgumentParser(description='Simple monitor service')
     parser.add_argument('-a', '--add-urls-file', required=False, type=str,
                         help='file of urls, line by line, to add')
-    parser.add_argument('-L', '--limit-urls', required=False, type=str, default="all",
+    parser.add_argument('-L', '--limit-urls', required=False, type=str,
+                        default="all",
                         help='Limit the number of urls to check.')
     parser.add_argument('-s', '--service', action='store_true',
                         help='Run as a service')
@@ -239,10 +248,10 @@ def main():
         get_events(topic)
         return
     if args.test_init:
-        test_init() 
+        test_init()
         return
     if args.add_urls_file:
-        add_urls(args.add_urls_file) 
+        add_urls(args.add_urls_file)
         return
     if args.service:
         while True:
@@ -253,4 +262,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main() 
+    main()
