@@ -104,3 +104,10 @@ docker-compose up -d
 - https://stackoverflow.com/ 
 - Google using Stackoverflow in name with issue
 
+
+# Todo
+- row level permissions for users
+- rest - https://postgrest.org/en/stable/
+- user attributes for notifications email
+- triggers
+- actions (notifications) 
