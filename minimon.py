@@ -1,33 +1,40 @@
 #!/usr/bin/env python3
+import argparse
+import asyncio
+import json
+import re
+import socket
+import time
+
+import aiohttp
+import dns.resolver
+from envyaml import EnvYAML
 from kafka import KafkaConsumer, KafkaProducer
 from kafka.admin import KafkaAdminClient, NewTopic
-import asyncio
-import aiohttp
-import time
-from envyaml import EnvYAML
-import json
-import socket
-import dns.resolver
-from urllib.parse import urlparse
-from requests import get
 import psycopg2
 import psycopg2.extras
-import re
-import argparse
+from requests import get
+from urllib.parse import urlparse
 
 
 conf = EnvYAML('conf.yml')
+try:
+    pgconn = psycopg2.connect(host=conf['postgres.host'],
+                              dbname=conf['postgres.dbname'],
+                              user=conf['postgres.dbuser'],
+                              password=conf['postgres.dbpass'])
+    pgconn.autocommit = True
+except Exception as e:
+    print(f"E: Unable to connect to database! {e}")
 topic = conf['kafka.topic']
 bootstrap_servers = conf['kafka.bootstrap_servers']
-pgconn = psycopg2.connect(host=conf['postgres.host'],
-                          dbname=conf['postgres.dbname'],
-                          user=conf['postgres.dbuser'],
-                          password=conf['postgres.dbpass'])
+consumer = KafkaConsumer(topic,
+                         auto_offset_reset='latest',
+                         bootstrap_servers=bootstrap_servers,
+                         group_id=conf['kafka.group_id'])
 producer = KafkaProducer(bootstrap_servers=bootstrap_servers,
                          value_serializer=lambda x:
                          json.dumps(x).encode('utf-8'))
-consumer = KafkaConsumer(topic, bootstrap_servers=bootstrap_servers,
-                         auto_offset_reset='latest')
 
 
 def init_kafka_topic(topic='test', client_id='test'):
@@ -48,6 +55,7 @@ def init_postgres():
         # cur.execute("WHERE NOT EXISTS
         #              (SELECT FROM pg_database WHERE = 'mydb')")
         cur.execute(open("schema.sql", "r").read())
+        cur.execute(open("data.sql", "r").read())
 
 
 def test_init():
@@ -56,11 +64,10 @@ def test_init():
 
 def add_urls(urls_file):
     with pgconn.cursor() as cur:
-        sql = "select url_group_id from url_group where name = 'unassigned'"
+        sql = "SELECT url_group_id FROM url_group WHERE name = 'unassigned'"
         cur.execute(sql)
         url_group_id = cur.fetchone()[0]
     with open(urls_file) as f:
-        # lines = f.readlines().strip()
         lines = f.read().splitlines()
     for url in lines:
         add_url(url_group_id, url)
@@ -68,13 +75,12 @@ def add_urls(urls_file):
 
 def add_url(url_group_id, url):
     with pgconn.cursor() as cur:
-        # https://www.psycopg.org/docs/cursor.html#cursor.copy_from
         cur.execute("select * from url where url = %s", (url,))
         if cur.rowcount == 0:
             print(f"Adding {url}")
             cur.execute("INSERT INTO url (url_group_id, url) VALUES (%s, %s)",
                         (url_group_id, url,))
-            pgconn.commit()
+            # pgconn.commit()
 
 
 def test_tcp_port(host, port):
@@ -155,59 +161,58 @@ def get_rsp_text_regex_count(regex, text):
 
 
 async def get_url(session, url_id, url, rsp_text_regex):
-    r = {}
-    r['url_id'] = url_id
+    msg = {}
+    msg['url_id'] = url_id
+    msg['error'] = None
+    msg['rsp_regex_count'] = None
+    msg['rsp_status_code'] = None
+    msg['http_rsp_time'] = None
+    msg['rsp_url'] = None
+    msg['dns'] = None
     try:
         async with session.get(url, allow_redirects=True) as rsp:
             dns = get_dns(url)
             start = time.time()
             rsp_text = await rsp.text()
-            rsp_time = time.time() - start
+            http_rsp_time = time.time() - start
             regex_count = get_rsp_text_regex_count(rsp_text_regex, rsp_text)
-            r['error'] = None
-            r['rsp_regex_count'] = regex_count
-            r['rsp_status_code'] = rsp.status
-            r['rsp_time'] = rsp_time
-            r['rsp_url'] = str(rsp.url)
-            r['dns'] = dns
-            return r
+            msg['rsp_regex_count'] = regex_count
+            msg['rsp_status_code'] = rsp.status
+            msg['http_rsp_time'] = http_rsp_time
+            msg['rsp_url'] = str(rsp.url)
+            msg['dns'] = dns
     except Exception as e:
-        r['error'] = str(e)
-        r['rsp_regex_count'] = None
-        r['rsp_status_code'] = None
-        r['rsp_time'] = None
-        r['rsp_url'] = None
-        r['dns'] = None
-        return r
+        msg['error'] = str(e)
+    return msg
 
 
 def get_dns(url):
     fqdn = urlparse(url).hostname
     dns_start = time.time()
     dns_response = dns.resolver.resolve(fqdn, 'A')
-    r = {}
+    msg = {}
     dns_time = time.time() - dns_start
-    r['dns_time'] = dns_time
-    r['tcp_times'] = []
+    msg['dns_time'] = dns_time
+    msg['tcp_times'] = []
     try:
+        hosts = {}
+        hosts['error'] = None
         for host in dns_response:
             tcp_rsp_time = test_tcp_port(host, 443)
-            hosts = {}
             hosts['host'] = str(host)
             hosts['tcp_rsp_time'] = tcp_rsp_time
-            r['tcp_times'].append(hosts)
-        return r
+            msg['tcp_times'].append(hosts)
     except Exception as e:
-        return str(e)
+        msg['tcp_times'].append(hosts)
+        hosts['error'] = str(e)
+    return msg
 
 
 async def check_urls():
     cur = pgconn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    # sql = "SELECT * FROM url limit 3"
-    sql = f"SELECT * FROM url limit {limit_urls}"
-    cur.execute(sql)
+    cur.execute("SELECT * FROM url limit %s", (limit_urls,))
     rows = cur.fetchall()
-    timeout = aiohttp.ClientTimeout(total=30)
+    timeout = aiohttp.ClientTimeout(total=conf['http_client.timeout'])
     async with aiohttp.ClientSession(timeout=timeout) as session:
         tasks = []
         for row in rows:
@@ -215,10 +220,10 @@ async def check_urls():
                                                        row['url_id'],
                                                        row['url'],
                                                        row['rsp_text_regex'])))
-        rsps = await asyncio.gather(*tasks)
-        for rsp in rsps:
+        msgs = await asyncio.gather(*tasks)
+        for msg in msgs:
             try:
-                put_event(topic, rsp)
+                put_event(topic, msg)
             except Exception as e:
                 print(f"ERROR: Push event failed! {e}")
 
@@ -242,7 +247,7 @@ def main():
     global limit_urls
     limit_urls = args.limit_urls
     if args.test_kafka:
-        put_event(topic, "foobar")
+        put_event(topic, conf['kafka.test_topic'])
         return
     if args.get_events:
         get_events(topic)
@@ -257,7 +262,6 @@ def main():
         while True:
             loop = asyncio.get_event_loop()
             loop.run_until_complete(check_urls())
-            time.sleep(30)
             time.sleep(conf['check_interval'])
 
 
