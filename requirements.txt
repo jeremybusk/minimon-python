@@ -5,11 +5,12 @@ certifi==2020.12.5
 chardet==4.0.0
 dnspython==2.1.0
 envyaml==1.8.210417
+flake8
 idna==2.10
 kafka-python==2.0.2
 multidict==5.1.0
 psycopg2-binary==2.8.6
+pytest
 typing-extensions==3.7.4.3
 urllib3==1.26.4
 yarl==1.6.3
-flake8
