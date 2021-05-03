@@ -1,0 +1,3 @@
+https://example.com|.*<title>Example Domain</title>.*
+https://example.org|.*<title>Example Domain</title>.*
+https://example.net|.*FooExample.*
