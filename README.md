@@ -149,8 +149,8 @@ docker-compose up -d
 
 # Todo
 - [ ] Check conversions
-- [ ] Refactor`
-- [ ] Unit/CI tests using pytests - https://docs.pytest.org/en/latest/ 
+- [ ] Refactor/simplify to fix organic growth.
+- [ ] Unit/CI/CD tests using pytests - https://docs.pytest.org/en/latest/ 
 - [ ] Row level permissions for users to control resources
 - [ ] Tables/colums for user attributes like email
 - [ ] Triggers interface tables/columns to make notification simple and easiy
