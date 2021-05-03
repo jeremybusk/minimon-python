@@ -148,6 +148,7 @@ docker-compose up -d
 
 
 # Todo
+- [ ] Fix docs while checking it works from scratch
 - [ ] Check conversions
 - [ ] Refactor/simplify to fix organic growth.
 - [ ] Unit/CI/CD tests using pytests - https://docs.pytest.org/en/latest/ 
