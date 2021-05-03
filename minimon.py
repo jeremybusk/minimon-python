@@ -54,7 +54,7 @@ def init_kafka_topic(topic=topic, client_id='test'):
     try:
         admin_client.delete_topics([topic])
     except Exception as e:
-        print(e) 
+        print(e)
     return
     topic_list = []
     topic_list.append(NewTopic(name=topic, num_partitions=1,
@@ -105,15 +105,12 @@ def kafka_to_pg(topic, offset='earliest'):
             print(e)
         try:
             with pgconn.cursor() as cur:
-                # cur.execute("INSERT INTO url_history (dns, error, event_timestamp, http_rsp_time, rsp_regex_count, rsp_status_code) VALUES (%s, %s, %s, %s, %s, %s)",
                 sql = """INSERT INTO url_history
                          (dns, error, event_timestamp, http_rsp_time,
                           rsp_regex_count, rsp_status_code)
                           VALUES (%s, %s, %s, %s, %s, %s)"""
                 cur.execute(sql, (dns, error, event_timestamp, http_rsp_time,
                                   rsp_regex_count, rsp_status_code,))
-                # cur.execute("INSERT INTO url_history (dns, error, event_timestamp, http_rsp_time, rsp_regex_count, rsp_status_code) VALUES (%s, %s, %s, %s, %s, %s)",
-                #     (dns, error, event_timestamp, http_rsp_time, rsp_regex_count, rsp_status_code,))
                 pgconn.commit()
         except Exception as e:
             print(e)
@@ -136,8 +133,10 @@ def add_url(pgconn, url_group_id, url, rsp_regex=None):
         cur.execute("select * from url where url = %s", (url,))
         if cur.rowcount == 0:
             print(f"Adding {url}")
-            cur.execute("INSERT INTO url (url_group_id, url, rsp_regex) VALUES (%s, %s, %s)",
-                        (url_group_id, url, rsp_regex,))
+            sql = """INSERT INTO url
+                   (url_group_id,url, rsp_regex)
+                   VALUES (%s, %s, %s)"""
+            cur.execute(sql, (url_group_id, url, rsp_regex,))
 
 
 def get_events(topic, offset='earliest'):
@@ -325,8 +324,7 @@ def main():
         get_events(topic)
         return
     if args.kafka_to_pg:
-        # kafka_to_pg(topic, offset='earliest') 
-        kafka_to_pg(topic, offset='latest') 
+        kafka_to_pg(topic, offset='latest')
         return
     limit_urls = args.limit_urls
     if args.test_kafka:
