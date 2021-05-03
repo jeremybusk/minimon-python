@@ -33,9 +33,10 @@ A miniture monitor that can actually do some mega monitoring
 # Docker Play Examples
 ```
 docker run -dit --name minimon-postgres -e POSTGRES_PASSWORD=secret -d postgres
-docker exec -it -e PGPASSWORD=secret minimon-postgres pg_dump -U postgres -h localhost -d minimon -s > schema.sql
-docker exec -it -e PGPASSWORD=secret minimon-postgres pg_dump -U postgres -h localhost -d minimon -a > data.sql
+docker exec -it -e PGPASSWORD=secret minimon-postgres pg_dump -U postgres -h localhost -d minimon -s --no-comments > schema.sql
+docker exec -it -e PGPASSWORD=secret minimon-postgres pg_dump -U postgres -h localhost -d minimon -a --no-comments > data.sql
 docker exec -it -e PGPASSWORD=secret minimon-postgres psql -U postgres -h localhost -d minimon
+cat data.sql | sed s/--.*$//g | sed -re '/^\s*$/d'
 
 curl -sSL https://raw.githubusercontent.com/bitnami/bitnami-docker-kafka/master/docker-compose.yml > docker-compose.yml
 docker-compose up -d
@@ -76,6 +77,9 @@ docker-compose up -d
 # Postgres
   - https://www.postgresql.org/docs/current/index.html
 
+## Possible Extentions
+ - https://github.com/petere/pguri  - uri type
+
 
 # Timescaledb - Good for time partitioning your metric item history/timeline table
 - https://docs.timescale.com/latest/using-timescaledb/hypertable://docs.timescale.com/latest/using-timescaledb/hypertabless
@@ -114,6 +118,9 @@ docker-compose up -d
 - https://stackoverflow.com/ 
 - Google using Stackoverflow in name with issue
 - Not using Bing
+
+# Github Actions
+- https://docs.github.com/en/actions/reference/workflow-syntax-for-github-actions
 
 
 # Todo
