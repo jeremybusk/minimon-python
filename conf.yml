@@ -2,13 +2,12 @@ check_interval: 30  # seconds
 http_client:
   timeout: 30  # seconds
 kafka:
-  bootstrap_servers: 'localhost:9092'  # bootstrap_servers: KAFKA_SVC_URI
-  group_id: 'demo'
+  bootstrap_servers: $KAFKA_SVC_URI  # bootstrap_servers: KAFKA_SVC_URI
   topic: 'demo'
   test_topic: 'test'
 postgres:
-    dbname: minimon 
+    dbname: $PGDATABASE 
     dbpass: $PGPASS
-    dbuser: postgres 
-    host: "172.17.0.3"
-    port: 5432 
+    dbuser: $PGUSER 
+    host: $PGHOST 
+    port: $PGPORT 

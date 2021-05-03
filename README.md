@@ -3,26 +3,28 @@ A miniture monitor that can actually do some mega monitoring
 
 # Usage
 
-## vim conf.yml
+vim conf.yml
 ```
-edit values
+edit values to match your Aiven or local postgres and kafka settings
 ```
 
-## Initialize
+Initialize persistent data stores
 ```
 ./minimon.py -K
 ./minimon.py -I
 ```
 
-# Run http url checkr 
+Run http url checker
 ```
 ./minimon.py -s
 ```
 
-# Run kafka to postgres consumer
+Run kafka to postgres consumer
 ```
 ./minimon.py -k
 ```
+
+# App
 
 # Scope
 - Simple python, postgres, golang event message handling. Use Golang for improved performance.
