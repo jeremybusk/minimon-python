@@ -1,15 +1,39 @@
 # Minimon
 A miniture monitor that can actually do some mega monitoring
 
+# Usage
+
+## vim conf.yml
+```
+edit values
+```
+
+## Initialize
+```
+./minimon.py -K
+./minimon.py -I
+```
+
+# Run http url checkr 
+```
+./minimon.py -s
+```
+
+# Run kafka to postgres consumer
+```
+./minimon.py -k
+```
+
 # Scope
 - Simple python, postgres, golang event message handling. Use Golang for improved performance.
 - Used aiohttp single async session for more performant experience.
 
 # Considerations
-- WARNING! This is a first try. Tried to do async and still have learning/work to do.
+- WARNING! This is a first try. Got a little cowboy on this. Tried to do async and still have learning/work to do.
 - I followed my interests while doing this project. Yes, it could have been done much simpler.
 - Needs more refactoring.
-- Yes, scope creep did happen. That's the way I roll and then I whack it back and in the process learn.
+- Yes, scope creep did happen. That's the way I roll sometimes and then I whack it back and in the process learn.
+- Probably should have started simple. This needs some organization. I probably am inefficent on type conversions.
 - Multiprocessing or threading are other options using python-requests and maybe some OOP
   - https://timber.io/blog/multiprocessing-vs-multithreading-in-python-what-you-need-to-know/
   - https://docs.python.org/3/library/multiprocessing.html
@@ -124,6 +148,8 @@ docker-compose up -d
 
 
 # Todo
+- [ ] Check conversions
+- [ ] Refactor`
 - [ ] Unit/CI tests using pytests - https://docs.pytest.org/en/latest/ 
 - [ ] Row level permissions for users to control resources
 - [ ] Tables/colums for user attributes like email
