@@ -164,7 +164,9 @@ def get_intranet_ip():
 def get_dns(url):
     fqdn = urlparse(url).hostname
     dns_start = time.time()
-    dns_response = dns.resolver.resolve(fqdn, 'A')
+    my_resolver = dns.resolver.Resolver()
+    my_resolver.nameservers = ['8.8.8.8']
+    dns_response = my_resolver.resolve(fqdn, 'A')
     msg = {}
     dns_time = time.time() - dns_start
     msg['dns_time'] = dns_time
