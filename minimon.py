@@ -1,349 +1,557 @@
 #!/usr/bin/env python3
 import argparse
 import asyncio
-import datetime
+from dataclasses import dataclass
+from datetime import UTC, datetime
 import json
+import os
+from pathlib import Path
 import re
 import socket
+import sys
 import time
+from urllib.parse import urlparse
 
 import aiohttp
 import dns.resolver
-from envyaml import EnvYAML
-from kafka import KafkaConsumer, KafkaProducer
-from kafka.admin import KafkaAdminClient, NewTopic
 import psycopg2
+from psycopg2 import sql
 import psycopg2.extras
-from requests import get
-from urllib.parse import urlparse
+import yaml
 
 
-conf = EnvYAML('conf.yml')
-
-bootstrap_servers = conf['kafka.bootstrap_servers']
-topic = conf['kafka.topic']
-consumer = KafkaConsumer(topic,
-                         auto_offset_reset='latest',
-                         bootstrap_servers=bootstrap_servers,
-                         value_deserializer=lambda x:
-                         json.loads(x).dencode('utf-8'),
-                         group_id=conf['kafka.group_id'])
-producer = KafkaProducer(bootstrap_servers=bootstrap_servers,
-                         value_serializer=lambda x:
-                         json.dumps(x).encode('utf-8'))
+BASE_DIR = Path(__file__).resolve().parent
+ENV_VAR_PATTERN = re.compile(r"\$(?:{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)}|"
+                             r"(?P<plain>[A-Za-z_][A-Za-z0-9_]*))")
 
 
-def create_pgconn(dbname=conf['postgres.dbname'], autocommit=True):
+class ConfigurationError(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class PostgresConfig:
+    host: str
+    dbname: str
+    user: str
+    password: str
+    port: int = 5432
+
+
+@dataclass(frozen=True)
+class KafkaConfig:
+    bootstrap_servers: str | list[str]
+    topic: str
+    group_id: str
+    test_topic: str = "test"
+
+
+@dataclass(frozen=True)
+class AppConfig:
+    postgres: PostgresConfig
+    kafka: KafkaConfig
+    http_timeout: float = 30
+    check_interval: float = 30
+
+
+def _expand_environment(value):
+    if isinstance(value, dict):
+        return {key: _expand_environment(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_expand_environment(item) for item in value]
+    if not isinstance(value, str):
+        return value
+
+    def replace(match):
+        name = match.group("braced") or match.group("plain")
+        try:
+            return os.environ[name]
+        except KeyError as exc:
+            raise ConfigurationError(
+                f"Environment variable {name} is required by the configuration"
+            ) from exc
+
+    return ENV_VAR_PATTERN.sub(replace, value)
+
+
+def _required(section, key, section_name):
     try:
-        pgconn = psycopg2.connect(host=conf['postgres.host'],
-                                  dbname=dbname,
-                                  user=conf['postgres.dbuser'],
-                                  password=conf['postgres.dbpass'])
-        pgconn.autocommit = autocommit
-        return pgconn
-    except Exception as e:
-        print(f"E: Unable to connect to database! {e}")
-        raise SystemExit
+        value = section[key]
+    except (KeyError, TypeError) as exc:
+        raise ConfigurationError(
+            f"Missing configuration value: {section_name}.{key}"
+        ) from exc
+    if value in (None, ""):
+        raise ConfigurationError(
+            f"Configuration value cannot be empty: {section_name}.{key}"
+        )
+    return value
 
 
-def init_kafka_topic(topic=topic, client_id='test'):
-    # This aint right
+def _positive_number(value, name, converter):
+    try:
+        parsed = converter(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigurationError(
+            f"Configuration value must be numeric: {name}"
+        ) from exc
+    if parsed <= 0:
+        raise ConfigurationError(
+            f"Configuration value must be greater than zero: {name}"
+        )
+    return parsed
+
+
+def load_config(path="conf.yml"):
+    config_path = Path(path)
+    try:
+        with config_path.open(encoding="utf-8") as config_file:
+            raw = yaml.safe_load(config_file)
+    except yaml.YAMLError as exc:
+        raise ConfigurationError(f"Invalid YAML in {config_path}: {exc}") from exc
+
+    if not isinstance(raw, dict):
+        raise ConfigurationError(f"Configuration in {config_path} must be a mapping")
+
+    raw = _expand_environment(raw)
+    postgres = _required(raw, "postgres", "configuration")
+    kafka = _required(raw, "kafka", "configuration")
+    http_client = raw.get("http_client", {})
+
+    return AppConfig(
+        postgres=PostgresConfig(
+            host=str(_required(postgres, "host", "postgres")),
+            port=_positive_number(
+                postgres.get("port", 5432), "postgres.port", int
+            ),
+            dbname=str(_required(postgres, "dbname", "postgres")),
+            user=str(_required(postgres, "dbuser", "postgres")),
+            password=str(_required(postgres, "dbpass", "postgres")),
+        ),
+        kafka=KafkaConfig(
+            bootstrap_servers=_required(
+                kafka, "bootstrap_servers", "kafka"
+            ),
+            topic=str(_required(kafka, "topic", "kafka")),
+            group_id=str(_required(kafka, "group_id", "kafka")),
+            test_topic=str(kafka.get("test_topic", "test")),
+        ),
+        http_timeout=_positive_number(
+            http_client.get("timeout", 30), "http_client.timeout", float
+        ),
+        check_interval=_positive_number(
+            raw.get("check_interval", 30), "check_interval", float
+        ),
+    )
+
+
+def create_pgconn(config, dbname=None, autocommit=True):
+    pgconn = psycopg2.connect(
+        host=config.postgres.host,
+        port=config.postgres.port,
+        dbname=dbname or config.postgres.dbname,
+        user=config.postgres.user,
+        password=config.postgres.password,
+    )
+    pgconn.autocommit = autocommit
+    return pgconn
+
+
+def create_kafka_consumer(config, offset="earliest", timeout_ms=None):
+    from kafka import KafkaConsumer
+    from kafka.serializer import JsonSerializer
+
+    options = {
+        "auto_offset_reset": offset,
+        "bootstrap_servers": config.kafka.bootstrap_servers,
+        "value_deserializer": JsonSerializer(),
+        "group_id": config.kafka.group_id,
+    }
+    if timeout_ms is not None:
+        options["consumer_timeout_ms"] = timeout_ms
+    return KafkaConsumer(config.kafka.topic, **options)
+
+
+def create_kafka_producer(config):
+    from kafka import KafkaProducer
+    from kafka.serializer import JsonSerializer
+
+    return KafkaProducer(
+        bootstrap_servers=config.kafka.bootstrap_servers,
+        value_serializer=JsonSerializer(),
+    )
+
+
+def init_kafka_topic(config):
+    from kafka.admin import KafkaAdminClient, NewTopic
+
     admin_client = KafkaAdminClient(
-        bootstrap_servers=bootstrap_servers,
+        bootstrap_servers=config.kafka.bootstrap_servers,
+        client_id="minimon-admin",
     )
     try:
-        admin_client.delete_topics([topic])
-    except Exception as e:
-        print(e)
-    return
-    topic_list = []
-    topic_list.append(NewTopic(name=topic, num_partitions=1,
-                      replication_factor=1))
-    admin_client.create_topics(new_topics=topic_list, validate_only=False)
+        if config.kafka.topic not in admin_client.list_topics():
+            admin_client.create_topics(new_topics=[
+                NewTopic(
+                    name=config.kafka.topic,
+                    num_partitions=1,
+                    replication_factor=1,
+                )
+            ])
+    finally:
+        admin_client.close()
 
 
-def init_postgres():
-    dbname = 'template1'
-    pgconn = create_pgconn(dbname)
-    with pgconn.cursor() as cur:
-        dbname = conf['postgres.dbname']
-        cur.execute(f"DROP DATABASE IF EXISTS {dbname} WITH (FORCE)")
-        cur.execute(f"CREATE DATABASE {dbname}")
+def init_postgres(config):
+    maintenance_conn = create_pgconn(config, dbname="template1")
+    try:
+        with maintenance_conn.cursor() as cursor:
+            database = sql.Identifier(config.postgres.dbname)
+            cursor.execute(
+                sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(database)
+            )
+            cursor.execute(sql.SQL("CREATE DATABASE {}").format(database))
+    finally:
+        maintenance_conn.close()
 
-    pgconn = create_pgconn(dbname)
-    with pgconn.cursor() as cur:
-        cur.execute(open("schema.sql", "r").read())
-
-    pgconn = create_pgconn(dbname)
-    with pgconn.cursor() as cur:
-        cur.execute("INSERT INTO url_group (name) VALUES ('unassigned')")
-        with open('seed-url.csv') as f:
-            lines = f.read().splitlines()
-            for line in lines:
-                r = (line).split('|')
-                url = r[0]
-                rsp_regex = r[1]
-                url_group_id = 1
-                add_url(pgconn, url_group_id, url, rsp_regex)
+    pgconn = create_pgconn(config)
+    try:
+        with pgconn.cursor() as cursor:
+            cursor.execute((BASE_DIR / "schema.sql").read_text(encoding="utf-8"))
+            cursor.execute("INSERT INTO url_group (name) VALUES (%s)",
+                           ("unassigned",))
+        seed_urls(pgconn, BASE_DIR / "seed-url.csv")
+    finally:
+        pgconn.close()
 
 
-def kafka_to_pg(topic, offset='earliest'):
-    consumer = KafkaConsumer(topic, auto_offset_reset=offset)
-    pgconn = create_pgconn(conf['postgres.dbname'], autocommit=False)
-    for msg in consumer:
-        try:
-            print(msg)
-            msg_value = json.loads(msg.value.decode())
-            dns = json.dumps(msg_value['dns'])
-            error = msg_value['error']
-            epoch = msg.timestamp/1000
-            event_timestamp = datetime.datetime.utcfromtimestamp(epoch)
-            http_rsp_time = msg_value['http_rsp_time']
-            rsp_regex_count = msg_value['rsp_regex_count']
-            rsp_status_code = msg_value['rsp_status_code']
-        except Exception as e:
-            print(e)
-        try:
-            with pgconn.cursor() as cur:
-                sql = """INSERT INTO url_history
-                         (dns, error, event_timestamp, http_rsp_time,
-                          rsp_regex_count, rsp_status_code)
-                          VALUES (%s, %s, %s, %s, %s, %s)"""
-                cur.execute(sql, (dns, error, event_timestamp, http_rsp_time,
-                                  rsp_regex_count, rsp_status_code,))
-                pgconn.commit()
-        except Exception as e:
-            print(e)
-            return
+def seed_urls(pgconn, urls_file):
+    for line in Path(urls_file).read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        url, separator, rsp_regex = line.partition("|")
+        add_url(pgconn, 1, url.strip(), rsp_regex if separator else None)
 
 
 def add_urls(pgconn, urls_file):
-    with pgconn.cursor() as cur:
-        sql = "SELECT url_group_id FROM url_group WHERE name = 'unassigned'"
-        cur.execute(sql)
-        url_group_id = cur.fetchone()[0]
-    with open(urls_file) as f:
-        lines = f.read().splitlines()
-    for url in lines:
-        add_url(url_group_id, url)
+    with pgconn.cursor() as cursor:
+        cursor.execute(
+            "SELECT url_group_id FROM url_group WHERE name = %s",
+            ("unassigned",),
+        )
+        row = cursor.fetchone()
+    if row is None:
+        raise RuntimeError("The unassigned URL group does not exist")
+
+    for url in Path(urls_file).read_text(encoding="utf-8").splitlines():
+        url = url.strip()
+        if url:
+            add_url(pgconn, row[0], url)
 
 
 def add_url(pgconn, url_group_id, url, rsp_regex=None):
-    with pgconn.cursor() as cur:
-        cur.execute("select * from url where url = %s", (url,))
-        if cur.rowcount == 0:
-            print(f"Adding {url}")
-            sql = """INSERT INTO url
-                   (url_group_id,url, rsp_regex)
-                   VALUES (%s, %s, %s)"""
-            cur.execute(sql, (url_group_id, url, rsp_regex,))
+    with pgconn.cursor() as cursor:
+        cursor.execute("SELECT 1 FROM url WHERE url = %s", (url,))
+        if cursor.fetchone() is None:
+            cursor.execute(
+                """INSERT INTO url (url_group_id, url, rsp_regex)
+                   VALUES (%s, %s, %s)""",
+                (url_group_id, url, rsp_regex),
+            )
 
 
-def get_events(topic, offset='earliest'):
-    consumer = KafkaConsumer(topic, auto_offset_reset=offset)
-    for msg in consumer:
-        try:
-            print(msg)
-        except Exception as e:
-            print(e)
+def event_from_message(message):
+    value = message.value
+    return {
+        "url_id": value["url_id"],
+        "dns": json.dumps(value.get("dns")),
+        "error": value.get("error"),
+        "event_timestamp": datetime.fromtimestamp(
+            message.timestamp / 1000, tz=UTC
+        ),
+        "http_rsp_time": value.get("http_rsp_time"),
+        "rsp_regex_count": value.get("rsp_regex_count"),
+        "rsp_status_code": value.get("rsp_status_code"),
+    }
 
 
-def get_internet_ip():
-    ip = get('https://api.ipify.org').text
-    return ip
+def insert_event(pgconn, event):
+    with pgconn.cursor() as cursor:
+        cursor.execute(
+            """INSERT INTO url_history
+               (url_id, dns, error, event_timestamp, http_rsp_time,
+                rsp_regex_count, rsp_status_code)
+               VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+            (
+                event["url_id"],
+                event["dns"],
+                event["error"],
+                event["event_timestamp"],
+                event["http_rsp_time"],
+                event["rsp_regex_count"],
+                event["rsp_status_code"],
+            ),
+        )
 
 
-def get_intranet_ip():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.connect(("8.8.8.8", 80))
-    ip = s.getsockname()[0]
-    s.close()
-    return ip
+def kafka_to_pg(config, offset="earliest", max_messages=None, timeout_ms=None):
+    consumer = create_kafka_consumer(config, offset, timeout_ms)
+    pgconn = create_pgconn(config, autocommit=False)
+    processed = 0
+    try:
+        for message in consumer:
+            try:
+                insert_event(pgconn, event_from_message(message))
+                pgconn.commit()
+                processed += 1
+            except (KeyError, TypeError, ValueError, psycopg2.Error) as exc:
+                pgconn.rollback()
+                print(f"Unable to store Kafka event: {exc}", file=sys.stderr)
+            if max_messages is not None and processed >= max_messages:
+                break
+    finally:
+        consumer.close()
+        pgconn.close()
+    if max_messages is not None and processed < max_messages:
+        raise RuntimeError(
+            f"Expected {max_messages} Kafka message(s), processed {processed}"
+        )
+    return processed
+
+
+def get_events(config, offset="earliest"):
+    consumer = create_kafka_consumer(config, offset)
+    try:
+        for message in consumer:
+            print(message.value)
+    finally:
+        consumer.close()
+
+
+def get_tcp_response_time(host, port, timeout=1):
+    start = time.perf_counter()
+    try:
+        with socket.create_connection((str(host), int(port)), timeout=timeout):
+            return time.perf_counter() - start
+    except OSError:
+        return None
 
 
 def get_dns(url):
-    fqdn = urlparse(url).hostname
-    dns_start = time.time()
-    my_resolver = dns.resolver.Resolver()
-    my_resolver.nameservers = ['8.8.8.8']
-    dns_response = my_resolver.resolve(fqdn, 'A')
-    msg = {}
-    dns_time = time.time() - dns_start
-    msg['dns_time'] = dns_time
-    msg['tcp_times'] = []
+    parsed_url = urlparse(url)
+    if not parsed_url.hostname:
+        raise ValueError(f"URL does not contain a hostname: {url}")
+
+    dns_start = time.perf_counter()
+    resolver = dns.resolver.Resolver()
+    resolver.nameservers = ["8.8.8.8"]
     try:
-        hosts = {}
-        hosts['error'] = None
-        for host in dns_response:
-            tcp_rsp_time = test_tcp_port(host, 443)
-            hosts['host'] = str(host)
-            hosts['tcp_rsp_time'] = tcp_rsp_time
-            msg['tcp_times'].append(hosts)
-    except Exception as e:
-        msg['tcp_times'].append(hosts)
-        hosts['error'] = str(e)
-    return msg
+        answers = resolver.resolve(parsed_url.hostname, "A")
+    except dns.exception.DNSException as exc:
+        return {
+            "dns_time": time.perf_counter() - dns_start,
+            "tcp_times": [],
+            "error": str(exc),
+        }
 
-
-def get_event_count(topic, offset='earliest'):
-    consumer = KafkaConsumer(topic, auto_offset_reset=offset)
-    msg_count = 0
-    for msg in consumer:
-        msg_count += 1
-    print(msg_count)
-
-
-def get_monitor_ips():
-    intranet_ip = get_intranet_ip()
-    internet_ip = get_internet_ip()
-    monitor_location = f"{intranet_ip}-{internet_ip}"
-    str(monitor_location)
+    port = parsed_url.port or (443 if parsed_url.scheme == "https" else 80)
+    result = {
+        "dns_time": time.perf_counter() - dns_start,
+        "tcp_times": [],
+        "error": None,
+    }
+    for answer in answers:
+        host = str(answer)
+        tcp_time = get_tcp_response_time(host, port)
+        result["tcp_times"].append({
+            "host": host,
+            "tcp_rsp_time": tcp_time,
+            "error": None if tcp_time is not None else "TCP connection failed",
+        })
+    return result
 
 
 def get_rsp_regex_count(regex, text):
     if not regex:
-        return
-    regexc = re.compile(regex)
-    count = len(regexc.findall(text))
-    return count
+        return None
+    return len(re.findall(regex, text))
 
 
 async def get_url(session, url_id, url, rsp_regex):
-    msg = {}
-    msg['url_id'] = url_id
-    msg['error'] = None
-    msg['rsp_regex_count'] = None
-    msg['rsp_status_code'] = None
-    msg['http_rsp_time'] = None
-    msg['rsp_url'] = None
-    msg['dns'] = None
-    async with session.get(url, allow_redirects=True) as rsp:
-        try:
-            dns = get_dns(url)
-            start = time.time()
-            rsp_text = await rsp.text()
-            http_rsp_time = time.time() - start
-            regex_count = get_rsp_regex_count(rsp_regex, rsp_text)
-            msg['rsp_regex_count'] = regex_count
-            msg['rsp_status_code'] = rsp.status
-            msg['http_rsp_time'] = http_rsp_time
-            msg['rsp_url'] = str(rsp.url)
-            msg['dns'] = dns
-        except Exception as e:
-            msg['error'] = str(e)
-            print(str(e))
-    return msg
-
-
-async def get_urls():
-    pgconn = create_pgconn()
-    cur = pgconn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute(f"SELECT * FROM url limit {limit_urls}")
-    rows = cur.fetchall()
-    timeout = aiohttp.ClientTimeout(total=conf['http_client.timeout'])
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        tasks = []
-        for row in rows:
-            tasks.append(asyncio.ensure_future(get_url(session,
-                                                       row['url_id'],
-                                                       row['url'],
-                                                       row['rsp_regex'])))
-        msgs = await asyncio.gather(*tasks)
-        for msg in msgs:
-            try:
-                put_event(topic, msg)
-            except Exception as e:
-                print(f"ERROR: Push event failed! {e}")
-
-
-def put_event(topic, msg):
-    if not isinstance(msg, dict):
-        print("ERROR: Put event not dict!")
-        return
-    print(msg)
-    producer.send(topic, msg)
-    producer.flush()
-
-
-def test_init():
-    init_kafka_topic()
-
-
-def test_tcp_port(host, port):
-    start = time.time()
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(1)
+    event = {
+        "url_id": url_id,
+        "error": None,
+        "rsp_regex_count": None,
+        "rsp_status_code": None,
+        "http_rsp_time": None,
+        "rsp_url": None,
+        "dns": None,
+    }
+    dns_task = asyncio.create_task(resolve_dns(url))
+    start = time.perf_counter()
     try:
-        s.connect((str(host), int(port)))
-        s.shutdown(socket.SHUT_RDWR)
-        s.close()
-        tcp_rsp_time = time.time() - start
-    except Exception as e:
-        tcp_rsp_time = None
-        str(e)
-    return tcp_rsp_time
+        async with session.get(url, allow_redirects=True) as response:
+            response_text = await response.text(errors="replace")
+            event["rsp_regex_count"] = get_rsp_regex_count(
+                rsp_regex, response_text
+            )
+            event["rsp_status_code"] = response.status
+            event["http_rsp_time"] = time.perf_counter() - start
+            event["rsp_url"] = str(response.url)
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, re.error) as exc:
+        event["error"] = str(exc)
+
+    try:
+        event["dns"] = await dns_task
+    except Exception as exc:
+        event["dns"] = {"dns_time": None, "tcp_times": [], "error": str(exc)}
+    return event
 
 
-def test_text_contains_string(text, string):
-    if string in text:
-        code = 0
-    else:
-        code = 1
-    return code
+async def resolve_dns(url):
+    return await asyncio.to_thread(get_dns, url)
 
 
-def main():
-    parser = argparse.ArgumentParser(description='Simple monitor service')
-    parser.add_argument('-a', '--add-urls-file', required=False, type=str,
-                        help='file of urls, line by line, to add')
-    parser.add_argument('-i', '--init-postgres', action='store_true',
-                        help='Delete/recreate or create database & populate!')
-    parser.add_argument('-I', '--init-kafka-topic', action='store_true',
-                        help='Delete/recreate or create kafka topic!')
-    parser.add_argument('-k', '--kafka-to-pg', action='store_true',
-                        help='Consume kafka url events and push to postgres.')
-    parser.add_argument('-g', '--get-events', action='store_true',
-                        help='Get/consume events from earliest')
-    parser.add_argument('-l', '--limit-urls', required=False, type=str,
-                        default="all",
-                        help='Limit the number of urls to check.')
-    parser.add_argument('-s', '--service', action='store_true',
-                        help='Run as a service')
-    parser.add_argument('-T', '--test-init', action='store_true',
-                        help='Initialize test')
-    parser.add_argument('--test-kafka', action='store_true',
-                        help='Initialize test')
-    args = parser.parse_args()
-    global limit_urls
-    if args.init_postgres:
-        init_postgres()
+def fetch_urls(config, limit=None):
+    pgconn = create_pgconn(config)
+    try:
+        with pgconn.cursor(
+            cursor_factory=psycopg2.extras.RealDictCursor
+        ) as cursor:
+            query = "SELECT url_id, url, rsp_regex FROM url ORDER BY url_id"
+            parameters = ()
+            if limit is not None:
+                query += " LIMIT %s"
+                parameters = (limit,)
+            cursor.execute(query, parameters)
+            return cursor.fetchall()
+    finally:
+        pgconn.close()
+
+
+def publish_events(config, events):
+    if not events:
         return
-    if args.init_kafka_topic:
-        init_kafka_topic()
-        return
-    pgconn = create_pgconn()
-    if args.get_events:
-        get_events(topic)
-        return
-    if args.kafka_to_pg:
-        kafka_to_pg(topic, offset='latest')
-        return
-    limit_urls = args.limit_urls
-    if args.test_kafka:
-        put_event(topic, conf['kafka.test_topic'])
-        return
-    if args.test_init:
-        test_init()
-        return
-    if args.add_urls_file:
-        add_urls(pgconn, args.add_urls_file)
-        return
-    if args.service:
-        while True:
-            loop = asyncio.get_event_loop()
-            loop.run_until_complete(get_urls())
-            time.sleep(conf['check_interval'])
+    producer = create_kafka_producer(config)
+    try:
+        for event in events:
+            producer.send(config.kafka.topic, event).get(timeout=10)
+        producer.flush()
+    finally:
+        producer.close()
+
+
+async def check_urls(config, limit=None):
+    rows = await asyncio.to_thread(fetch_urls, config, limit)
+    timeout = aiohttp.ClientTimeout(total=config.http_timeout)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        events = await asyncio.gather(*(
+            get_url(session, row["url_id"], row["url"], row["rsp_regex"])
+            for row in rows
+        ))
+    await asyncio.to_thread(publish_events, config, events)
+    return events
+
+
+async def run_service(config, limit=None):
+    while True:
+        await check_urls(config, limit)
+        await asyncio.sleep(config.check_interval)
+
+
+def positive_int(value):
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return parsed
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description="Simple monitor service")
+    parser.add_argument(
+        "-c", "--config", default="conf.yml", help="configuration file"
+    )
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument(
+        "-a", "--add-urls-file", metavar="FILE",
+        help="add URLs from a file, one per line",
+    )
+    actions.add_argument(
+        "-i", "--init-postgres", action="store_true",
+        help="delete, recreate, and populate the database",
+    )
+    actions.add_argument(
+        "-I", "--init-kafka-topic", action="store_true",
+        help="create the Kafka topic if it does not exist",
+    )
+    actions.add_argument(
+        "-k", "--kafka-to-pg", action="store_true",
+        help="consume Kafka URL events and store them in PostgreSQL",
+    )
+    actions.add_argument(
+        "-g", "--get-events", action="store_true",
+        help="print events from the earliest available offset",
+    )
+    actions.add_argument(
+        "-s", "--service", action="store_true",
+        help="continuously check configured URLs",
+    )
+    actions.add_argument(
+        "--once", action="store_true", help="check configured URLs once"
+    )
+    actions.add_argument(
+        "--test-kafka", action="store_true", help="publish a test event"
+    )
+    parser.add_argument(
+        "-l", "--limit-urls", type=positive_int,
+        help="maximum number of URLs to check",
+    )
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not any((
+        args.add_urls_file,
+        args.init_postgres,
+        args.init_kafka_topic,
+        args.kafka_to_pg,
+        args.get_events,
+        args.service,
+        args.once,
+        args.test_kafka,
+    )):
+        parser.print_help()
+        return 0
+
+    try:
+        config = load_config(args.config)
+        if args.init_postgres:
+            init_postgres(config)
+        elif args.init_kafka_topic:
+            init_kafka_topic(config)
+        elif args.kafka_to_pg:
+            kafka_to_pg(config, offset="latest")
+        elif args.get_events:
+            get_events(config)
+        elif args.add_urls_file:
+            pgconn = create_pgconn(config)
+            try:
+                add_urls(pgconn, args.add_urls_file)
+            finally:
+                pgconn.close()
+        elif args.service:
+            asyncio.run(run_service(config, args.limit_urls))
+        elif args.once:
+            asyncio.run(check_urls(config, args.limit_urls))
+        elif args.test_kafka:
+            publish_events(config, [{"test": config.kafka.test_topic}])
+    except Exception as exc:
+        print(f"minimon: {exc}", file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

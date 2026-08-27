@@ -3,7 +3,6 @@ SET lock_timeout = 0;
 SET idle_in_transaction_session_timeout = 0;
 SET client_encoding = 'UTF8';
 SET standard_conforming_strings = on;
-SELECT pg_catalog.set_config('search_path', '', false);
 SET check_function_bodies = false;
 SET xmloption = content;
 SET client_min_messages = warning;
@@ -24,7 +23,6 @@ CREATE TABLE public.url (
     rsp_code smallint,
     sequence smallint
 );
-ALTER TABLE public.url OWNER TO postgres;
 
 DROP TABLE IF EXISTS public.url_group CASCADE;
 CREATE TABLE public.url_group (
@@ -33,7 +31,6 @@ CREATE TABLE public.url_group (
     name character varying(255) NOT NULL,
     notes character varying(255)
 );
-ALTER TABLE public.url_group OWNER TO postgres;
 ALTER TABLE public.url_group ALTER COLUMN url_group_id ADD GENERATED ALWAYS AS IDENTITY (
     SEQUENCE NAME public.url_group_url_group_id_seq
     START WITH 1
@@ -47,15 +44,14 @@ DROP TABLE IF EXISTS public.url_history CASCADE;
 CREATE TABLE public.url_history (
     url_history_id bigint NOT NULL,
     url_id bigint,
-    error varchar(255),
+    error text,
     event_timestamp timestamp(6) with time zone NOT NULL,
     dns jsonb,
-    http_rsp_time numeric(14,8) DEFAULT 0.0000 NOT NULL,
+    http_rsp_time numeric(14,8),
     rsp_regex_count smallint,
     rsp_status_code smallint,
     ts_created_at timestamp(6) with time zone DEFAULT now()
 );
-ALTER TABLE public.url_history OWNER TO postgres;
 ALTER TABLE public.url_history ALTER COLUMN url_history_id ADD GENERATED ALWAYS AS IDENTITY (
     SEQUENCE NAME public.url_history_url_history_id_seq
     START WITH 1
