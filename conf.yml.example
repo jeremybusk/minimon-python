@@ -7,8 +7,8 @@ kafka:
   topic: 'demo'
   test_topic: 'test'
 postgres:
-    dbname: minimon 
+    dbname: minimon
     dbpass: $PGPASS
-    dbuser: postgres 
-    host: "172.17.0.3"
-    port: 5432 
+    dbuser: postgres
+    host: localhost
+    port: 5432
