@@ -12,13 +12,13 @@ pytestmark = pytest.mark.integration
 
 def test_kafka_event_is_stored_in_postgres():
     postgres = PostgresContainer(
-        image="postgres:17-alpine",
+        image="postgres:18-alpine",
         username="minimon",
         password="minimon",
         dbname="minimon",
     )
     kafka = KafkaContainer(
-        image="confluentinc/cp-kafka:7.6.0"
+        image="confluentinc/cp-kafka:8.0.7"
     ).with_kraft()
 
     with postgres, kafka:
