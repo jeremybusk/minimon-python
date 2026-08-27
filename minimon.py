@@ -157,24 +157,28 @@ def create_pgconn(config, dbname=None, autocommit=True):
     return pgconn
 
 
-def create_kafka_consumer(config, offset="earliest"):
+def create_kafka_consumer(config, offset="earliest", timeout_ms=None):
     from kafka import KafkaConsumer
+    from kafka.serializer import JsonSerializer
 
-    return KafkaConsumer(
-        config.kafka.topic,
-        auto_offset_reset=offset,
-        bootstrap_servers=config.kafka.bootstrap_servers,
-        value_deserializer=lambda value: json.loads(value.decode("utf-8")),
-        group_id=config.kafka.group_id,
-    )
+    options = {
+        "auto_offset_reset": offset,
+        "bootstrap_servers": config.kafka.bootstrap_servers,
+        "value_deserializer": JsonSerializer(),
+        "group_id": config.kafka.group_id,
+    }
+    if timeout_ms is not None:
+        options["consumer_timeout_ms"] = timeout_ms
+    return KafkaConsumer(config.kafka.topic, **options)
 
 
 def create_kafka_producer(config):
     from kafka import KafkaProducer
+    from kafka.serializer import JsonSerializer
 
     return KafkaProducer(
         bootstrap_servers=config.kafka.bootstrap_servers,
-        value_serializer=lambda value: json.dumps(value).encode("utf-8"),
+        value_serializer=JsonSerializer(),
     )
 
 
@@ -290,20 +294,29 @@ def insert_event(pgconn, event):
         )
 
 
-def kafka_to_pg(config, offset="earliest"):
-    consumer = create_kafka_consumer(config, offset)
+def kafka_to_pg(config, offset="earliest", max_messages=None, timeout_ms=None):
+    consumer = create_kafka_consumer(config, offset, timeout_ms)
     pgconn = create_pgconn(config, autocommit=False)
+    processed = 0
     try:
         for message in consumer:
             try:
                 insert_event(pgconn, event_from_message(message))
                 pgconn.commit()
+                processed += 1
             except (KeyError, TypeError, ValueError, psycopg2.Error) as exc:
                 pgconn.rollback()
                 print(f"Unable to store Kafka event: {exc}", file=sys.stderr)
+            if max_messages is not None and processed >= max_messages:
+                break
     finally:
         consumer.close()
         pgconn.close()
+    if max_messages is not None and processed < max_messages:
+        raise RuntimeError(
+            f"Expected {max_messages} Kafka message(s), processed {processed}"
+        )
+    return processed
 
 
 def get_events(config, offset="earliest"):

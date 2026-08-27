@@ -8,6 +8,7 @@ stores consumed events in PostgreSQL.
 - Python 3.10 or newer
 - PostgreSQL
 - Kafka
+- Docker, for integration tests only
 
 ## Setup
 
@@ -67,6 +68,9 @@ Use a different configuration file with `--config PATH`. Run `./minimon.py
 ## Development
 
 ```bash
-python -m pytest
-python -m flake8 minimon.py minimon-consumer.py test_minimon.py
+./scripts/test.sh
 ```
+
+The script runs lint and unit tests first, then starts temporary Kafka and
+PostgreSQL containers for one end-to-end persistence test. The containers and
+their data are removed automatically when the test finishes.
